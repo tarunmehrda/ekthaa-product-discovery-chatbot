@@ -1,10 +1,17 @@
 import os
 import sqlite3
 import re
+import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+
+try:
+    import streamlit as st
+    STREAMLIT_AVAILABLE = True
+except ImportError:
+    STREAMLIT_AVAILABLE = False
 
 from utils.groq_client import llm_extract, llm_fallback_response, llm_suggest_questions
 from utils.query_parser import fuzzy_product_match, fuzzy_category_match
@@ -354,3 +361,308 @@ def suggest():
                 "Do you have apples?"
             ]
         }
+
+# Streamlit Chat UI
+def run_streamlit_app():
+    if not STREAMLIT_AVAILABLE:
+        print("Streamlit not installed. Run: pip install streamlit")
+        return
+    
+    st.set_page_config(
+        page_title="Ekthaa Product Discovery Chatbot",
+        page_icon="🛒",
+        layout="centered"
+    )
+    
+    st.title("🛒 Ekthaa Product Discovery Chatbot")
+    st.markdown("Find grocery and vegetable products easily!")
+    
+    # Initialize chat history
+    if "messages" not in st.session_state:
+        st.session_state.messages = [
+            {"role": "assistant", "content": "Hi! I can help you find grocery and vegetable products. Try asking me things like:\n• Show me rice under 150\n• Where can I buy vegetables?\n• Grocery stores near me\n• Who sells dal?"}
+        ]
+    
+    # Display chat messages
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+    
+    # Chat input
+    if prompt := st.chat_input("Ask about products..."):
+        # Add user message to chat history
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        # Get bot response
+        with st.chat_message("assistant"):
+            with st.spinner("Searching..."):
+                try:
+                    # Use Groq API directly for chat response
+                    try:
+                        # Extract intent using Groq
+                        parsed = llm_extract(prompt)
+                        
+                        # Context support (followups)
+                        context = get_context("streamlit_user")
+                        parsed = {
+                            "intent": parsed.get("intent") or context.get("intent"),
+                            "product_name": parsed.get("product_name") or context.get("product_name"),
+                            "category": parsed.get("category") or context.get("category"),
+                            "max_price": parsed.get("max_price") if parsed.get("max_price") is not None else context.get("max_price"),
+                            "business_category": parsed.get("business_category") or context.get("business_category"),
+                        }
+                        update_context("streamlit_user", parsed)
+                        
+                        intent = parsed["intent"]
+                        
+                        # Use the same logic as FastAPI but with Groq for responses
+                        if intent in ["product_search", "price_filter"]:
+                            # typo handling: product name
+                            if parsed["product_name"]:
+                                corrected = fuzzy_product_match(parsed["product_name"])
+                                if corrected:
+                                    parsed["product_name"] = corrected
+
+                            if parsed["category"]:
+                                corrected_cat = fuzzy_category_match(parsed["category"])
+                                if corrected_cat:
+                                    parsed["category"] = corrected_cat
+
+                            prods = fetch_products(
+                                product_name=parsed["product_name"],
+                                category=parsed["category"],
+                                max_price=parsed["max_price"]
+                            )
+
+                            if not prods:
+                                # Use Groq for fallback response
+                                fallback = llm_fallback_response(prompt, detected_intent=parsed)
+                                st.markdown(fallback)
+                                st.session_state.messages.append({"role": "assistant", "content": fallback})
+                            else:
+                                # Generate response using Groq
+                                m_lower = prompt.lower()
+                                if parsed.get("max_price") is not None and not parsed.get("product_name") and not parsed.get("category"):
+                                    header = f"Found {len(prods)} products under Rs.{int(parsed['max_price'])}:\n"
+                                    lines = []
+                                    for i, p in enumerate(prods, start=1):
+                                        lines.append(
+                                            f"{i}. {p['name']} - Rs.{p['price']}/{p['unit']}\n{p['business_name']}, {_locality(p['business_address'])}"
+                                        )
+                                    bot_response = header + "\n".join(lines)
+                                elif len(prods) == 1:
+                                    p = prods[0]
+                                    if "who sells" in m_lower or "who sell" in m_lower:
+                                        bot_response = (
+                                            f"{p['name']} is available at:\n"
+                                            f"{p['name']} - Rs.{p['price']}/{p['unit']}\n"
+                                            f"{p['business_name']}\n"
+                                            f"{p['business_address']}\n"
+                                            f"Phone: {p['business_phone']}"
+                                        )
+                                    else:
+                                        bot_response = (
+                                            "Found 1 product:\n"
+                                            f"{p['name']} - Rs.{p['price']}/{p['unit']}\n"
+                                            f"Available at: {p['business_name']}, {_locality(p['business_address'])}\n"
+                                            f"Call: {p['business_phone']}"
+                                        )
+                                else:
+                                    header = f"Found {len(prods)} products:\n\n"
+                                    lines = []
+                                    for i, p in enumerate(prods, start=1):
+                                        lines.append(
+                                            f"{i}. {p['name']} - Rs.{p['price']}/{p['unit']}\n{p['business_name']}, {_locality(p['business_address'])}\nPhone: {p['business_phone']}"
+                                        )
+                                    bot_response = header + "\n\n".join(lines)
+                                
+                                st.markdown(bot_response)
+                                
+                                # Show products
+                                products = _serialize_products(prods)
+                                if products:
+                                    st.subheader(f"📦 Found {len(products)} product(s):")
+                                    for i, product in enumerate(products, 1):
+                                        with st.expander(f"{i}. {product['name']} - Rs.{product['price']}/{product['unit']}"):
+                                            col1, col2 = st.columns(2)
+                                            with col1:
+                                                st.write(f"**Category:** {product['category']}")
+                                                st.write(f"**Price:** Rs.{product['price']}/{product['unit']}")
+                                            with col2:
+                                                st.write(f"**Store:** {product['business']['name']}")
+                                                st.write(f"**Location:** {product['business']['address']}")
+                                                st.write(f"**Phone:** {product['business']['phone']}")
+                                
+                                st.session_state.messages.append({"role": "assistant", "content": bot_response})
+
+                        elif intent == "category_search":
+                            # category fuzzy match
+                            if parsed["category"]:
+                                corrected_cat = fuzzy_category_match(parsed["category"])
+                                if corrected_cat:
+                                    parsed["category"] = corrected_cat
+
+                            if not parsed["category"]:
+                                parsed["category"] = "Vegetables"
+
+                            businesses = fetch_businesses(business_category=parsed["category"])
+                            if not businesses:
+                                bot_response = "No businesses found in this category."
+                                st.markdown(bot_response)
+                                st.session_state.messages.append({"role": "assistant", "content": bot_response})
+                            else:
+                                # pick first relevant business
+                                b = businesses[0]
+                                products = fetch_products(category=parsed["category"])
+
+                                bot_response = (
+                                    f"{b['name']} in {_locality(b['address'])} specializes in {parsed['category'].lower()}.\n"
+                                    f"Available products:\n"
+                                )
+                                for p in products:
+                                    if p["business_name"] == b["name"]:
+                                        bot_response += f"• {p['name']} - Rs.{p['price']}/{p['unit']}\n"
+                                bot_response += f"Address: {b['address']}\nPhone: {b['phone']}"
+
+                                st.markdown(bot_response.strip())
+                                
+                                # Show businesses
+                                st.subheader(f"🏪 Found {len(businesses)} store(s):")
+                                for i, business in enumerate(businesses, 1):
+                                    with st.expander(f"{i}. {business['name']} - {business['address'].split(',')[0]}"):
+                                        st.write(f"**Address:** {business['address']}")
+                                        st.write(f"**Phone:** {business['phone']}")
+                                        if business.get('products'):
+                                            st.write(f"**Products:** {', '.join(business['products'])}")
+                                
+                                st.session_state.messages.append({"role": "assistant", "content": bot_response.strip()})
+
+                        elif intent == "business_finder":
+                            businesses = fetch_businesses(business_category=parsed["business_category"])
+                            if not businesses:
+                                businesses = fetch_businesses()  # fallback
+
+                            header = f"Found {len(businesses)} store(s):\n\n"
+                            if parsed.get("business_category"):
+                                header = f"Found {len(businesses)} {parsed['business_category'].lower()} stores:\n\n"
+
+                            lines = []
+                            for i, b in enumerate(businesses, start=1):
+                                prod_names = ", ".join(b.get("products", []))
+                                lines.append(
+                                    f"{i}. {b['name']} - {_locality(b['address'])}\nProducts: {prod_names}\nPhone: {b['phone']}"
+                                )
+
+                            bot_response = header + "\n\n".join(lines)
+                            st.markdown(bot_response)
+                            
+                            # Show businesses
+                            st.subheader(f"🏪 Found {len(businesses)} store(s):")
+                            for i, business in enumerate(businesses, 1):
+                                with st.expander(f"{i}. {business['name']} - {business['address'].split(',')[0]}"):
+                                    st.write(f"**Address:** {business['address']}")
+                                    st.write(f"**Phone:** {business['phone']}")
+                                    if business.get('products'):
+                                        st.write(f"**Products:** {', '.join(business['products'])}")
+                            
+                            st.session_state.messages.append({"role": "assistant", "content": bot_response})
+
+                        else:
+                            # Use Groq for fallback response
+                            fallback = llm_fallback_response(prompt, detected_intent=parsed)
+                            st.markdown(fallback)
+                            st.session_state.messages.append({"role": "assistant", "content": fallback})
+
+                    except Exception as groq_error:
+                        # Fallback to calling FastAPI if Groq fails
+                        response = requests.post(
+                            "http://localhost:8000/chat",
+                            json={"message": prompt, "user_id": "streamlit_user"},
+                            timeout=10
+                        )
+                        
+                        if response.status_code == 200:
+                            data = response.json()
+                            bot_response = data.get("response", "Sorry, I couldn't process your request.")
+                            st.markdown(bot_response)
+                            
+                            # Show products if any
+                            products = data.get("products", [])
+                            if products:
+                                st.subheader(f"📦 Found {len(products)} product(s):")
+                                for i, product in enumerate(products, 1):
+                                    with st.expander(f"{i}. {product['name']} - Rs.{product['price']}/{product['unit']}"):
+                                        col1, col2 = st.columns(2)
+                                        with col1:
+                                            st.write(f"**Category:** {product['category']}")
+                                            st.write(f"**Price:** Rs.{product['price']}/{product['unit']}")
+                                        with col2:
+                                            st.write(f"**Store:** {product['business']['name']}")
+                                            st.write(f"**Location:** {product['business']['address']}")
+                                            st.write(f"**Phone:** {product['business']['phone']}")
+                            
+                            # Show businesses if any
+                            businesses = data.get("businesses", [])
+                            if businesses:
+                                st.subheader(f"🏪 Found {len(businesses)} store(s):")
+                                for i, business in enumerate(businesses, 1):
+                                    with st.expander(f"{i}. {business['name']} - {business['address'].split(',')[0]}"):
+                                        st.write(f"**Address:** {business['address']}")
+                                        st.write(f"**Phone:** {business['phone']}")
+                                        if business.get('products'):
+                                            st.write(f"**Products:** {', '.join(business['products'])}")
+                            
+                            st.session_state.messages.append({"role": "assistant", "content": bot_response})
+                        else:
+                            error_msg = "Sorry, I'm having trouble connecting to the service."
+                            st.error(error_msg)
+                            st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                
+                except requests.exceptions.RequestException as e:
+                    error_msg = f"Connection error: Please make sure the FastAPI server is running on localhost:8000\n\nError: {str(e)}"
+                    st.error(error_msg)
+                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                
+                except Exception as e:
+                    error_msg = f"An error occurred: {str(e)}"
+                    st.error(error_msg)
+                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
+    
+    # Sidebar with example questions
+    with st.sidebar:
+        st.header("💡 Example Questions")
+        example_questions = [
+            "Show me rice",
+            "Products under Rs.50",
+            "Where can I buy vegetables?",
+            "Grocery stores near me",
+            "Who sells dal?",
+            "Do you have apples?"
+        ]
+        
+        for question in example_questions:
+            if st.button(question, key=f"example_{question}"):
+                st.session_state.messages.append({"role": "user", "content": question})
+                st.rerun()
+        
+        st.header("📊 About")
+        st.info("This chatbot helps you discover grocery and vegetable products from local stores in your area.")
+        
+        st.header("🔧 How to Use")
+        st.markdown("""
+        1. Start the FastAPI server: `python app.py`
+        2. Run Streamlit: `streamlit run app.py`
+        3. Ask about products!
+        
+        **Note:** Make sure both servers are running.
+        """)
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "streamlit":
+        run_streamlit_app()
+    else:
+        import uvicorn
+        uvicorn.run(app, host="0.0.0.0", port=8000)
