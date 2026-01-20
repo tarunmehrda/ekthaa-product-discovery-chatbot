@@ -1,11 +1,17 @@
 import os
 import sqlite3
 import re
-import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+
+# Conditional imports for different deployment modes
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
 
 try:
     import streamlit as st
@@ -577,56 +583,59 @@ def run_streamlit_app():
 
                     except Exception as groq_error:
                         # Fallback to calling FastAPI if Groq fails
-                        response = requests.post(
-                            "http://localhost:8000/chat",
-                            json={"message": prompt, "user_id": "streamlit_user"},
-                            timeout=10
-                        )
-                        
-                        if response.status_code == 200:
-                            data = response.json()
-                            bot_response = data.get("response", "Sorry, I couldn't process your request.")
-                            st.markdown(bot_response)
+                        if REQUESTS_AVAILABLE:
+                            response = requests.post(
+                                "http://localhost:8000/chat",
+                                json={"message": prompt, "user_id": "streamlit_user"},
+                                timeout=10
+                            )
                             
-                            # Show products if any
-                            products = data.get("products", [])
-                            if products:
-                                st.subheader(f"📦 Found {len(products)} product(s):")
-                                for i, product in enumerate(products, 1):
-                                    with st.expander(f"{i}. {product['name']} - Rs.{product['price']}/{product['unit']}"):
-                                        col1, col2 = st.columns(2)
-                                        with col1:
-                                            st.write(f"**Category:** {product['category']}")
-                                            st.write(f"**Price:** Rs.{product['price']}/{product['unit']}")
-                                        with col2:
-                                            st.write(f"**Store:** {product['business']['name']}")
-                                            st.write(f"**Location:** {product['business']['address']}")
-                                            st.write(f"**Phone:** {product['business']['phone']}")
-                            
-                            # Show businesses if any
-                            businesses = data.get("businesses", [])
-                            if businesses:
-                                st.subheader(f"🏪 Found {len(businesses)} store(s):")
-                                for i, business in enumerate(businesses, 1):
-                                    with st.expander(f"{i}. {business['name']} - {business['address'].split(',')[0]}"):
-                                        st.write(f"**Address:** {business['address']}")
-                                        st.write(f"**Phone:** {business['phone']}")
-                                        if business.get('products'):
-                                            st.write(f"**Products:** {', '.join(business['products'])}")
-                            
-                            st.session_state.messages.append({"role": "assistant", "content": bot_response})
+                            if response.status_code == 200:
+                                data = response.json()
+                                bot_response = data.get("response", "Sorry, I couldn't process your request.")
+                                st.markdown(bot_response)
+                                
+                                # Show products if any
+                                products = data.get("products", [])
+                                if products:
+                                    st.subheader(f"📦 Found {len(products)} product(s):")
+                                    for i, product in enumerate(products, 1):
+                                        with st.expander(f"{i}. {product['name']} - Rs.{product['price']}/{product['unit']}"):
+                                            col1, col2 = st.columns(2)
+                                            with col1:
+                                                st.write(f"**Category:** {product['category']}")
+                                                st.write(f"**Price:** Rs.{product['price']}/{product['unit']}")
+                                            with col2:
+                                                st.write(f"**Store:** {product['business']['name']}")
+                                                st.write(f"**Location:** {product['business']['address']}")
+                                                st.write(f"**Phone:** {product['business']['phone']}")
+                                
+                                # Show businesses if any
+                                businesses = data.get("businesses", [])
+                                if businesses:
+                                    st.subheader(f"🏪 Found {len(businesses)} store(s):")
+                                    for i, business in enumerate(businesses, 1):
+                                        with st.expander(f"{i}. {business['name']} - {business['address'].split(',')[0]}"):
+                                            st.write(f"**Address:** {business['address']}")
+                                            st.write(f"**Phone:** {business['phone']}")
+                                            if business.get('products'):
+                                                st.write(f"**Products:** {', '.join(business['products'])}")
+                                
+                                st.session_state.messages.append({"role": "assistant", "content": bot_response})
+                            else:
+                                error_msg = "Sorry, I'm having trouble connecting to the service."
+                                st.error(error_msg)
+                                st.session_state.messages.append({"role": "assistant", "content": error_msg})
                         else:
-                            error_msg = "Sorry, I'm having trouble connecting to the service."
+                            error_msg = "Requests module not available. Please install requests: pip install requests"
                             st.error(error_msg)
                             st.session_state.messages.append({"role": "assistant", "content": error_msg})
                 
-                except requests.exceptions.RequestException as e:
-                    error_msg = f"Connection error: Please make sure the FastAPI server is running on localhost:8000\n\nError: {str(e)}"
-                    st.error(error_msg)
-                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
-                
                 except Exception as e:
-                    error_msg = f"An error occurred: {str(e)}"
+                    if REQUESTS_AVAILABLE and hasattr(requests, 'exceptions') and isinstance(e, requests.exceptions.RequestException):
+                        error_msg = f"Connection error: Please make sure the FastAPI server is running on localhost:8000\n\nError: {str(e)}"
+                    else:
+                        error_msg = f"An error occurred: {str(e)}"
                     st.error(error_msg)
                     st.session_state.messages.append({"role": "assistant", "content": error_msg})
     
